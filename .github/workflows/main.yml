@@ -10,9 +10,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-        with:
-          repository: ${{ vars.REPOSITORY }}
-          ref: ${{ vars.REF }}
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
@@ -27,8 +24,17 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
           CUSTOM_CONFIG: ${{ vars.CUSTOM_CONFIG }}
+          ARXIV_QUERY: ${{ secrets.ARXIV_QUERY }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SEND_EMPTY: ${{ vars.SEND_EMPTY }}
+          MAX_PAPER_NUM: ${{ secrets.MAX_PAPER_NUM }}
+          MODEL_NAME: ${{ secrets.MODEL_NAME }}
+          LANGUAGE: ${{ vars.LANGUAGE }}
         run: |
-          printf "%b\n" "$CUSTOM_CONFIG" > config/custom.yaml
-          echo "Use custom config: "
-          cat config/custom.yaml
+          if [ -n "$CUSTOM_CONFIG" ]; then
+            printf "%b\n" "$CUSTOM_CONFIG" > config/custom.yaml
+          else
+            uv run python scripts/prepare_legacy_config.py --output config/custom.yaml
+          fi
           uv run src/zotero_arxiv_daily/main.py
