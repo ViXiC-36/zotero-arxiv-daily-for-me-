@@ -3,7 +3,7 @@ from pyzotero import zotero
 from omegaconf import DictConfig, ListConfig
 from .utils import glob_match
 from .retriever import get_retriever_cls
-from .protocol import CorpusPaper
+from .protocol import CorpusPaper, Paper
 import random
 from datetime import datetime
 from .reranker import get_reranker_cls
@@ -38,7 +38,30 @@ class Executor:
             source: get_retriever_cls(source)(config) for source in config.executor.source
         }
         self.reranker = get_reranker_cls(config.executor.reranker)(config)
-        self.openai_client = OpenAI(api_key=config.llm.api.key, base_url=config.llm.api.base_url)
+        api_key = str(config.llm.api.key or "").strip()
+        self.openai_client = (
+            OpenAI(api_key=api_key, base_url=config.llm.api.base_url)
+            if api_key
+            else None
+        )
+        if self.openai_client is None:
+            logger.warning(
+                "OPENAI_API_KEY is not configured; email delivery remains enabled, "
+                "using paper abstracts instead of generated TLDRs."
+            )
+
+    def enrich_papers(self, papers: list[Paper]) -> None:
+        if self.openai_client is None:
+            for paper in papers:
+                paper.tldr = paper.abstract
+                paper.affiliations = None
+            return
+
+        logger.info("Generating TLDR and affiliations...")
+        for paper in tqdm(papers):
+            paper.generate_tldr(self.openai_client, self.config.llm)
+            paper.generate_affiliations(self.openai_client, self.config.llm)
+
     def fetch_zotero_corpus(self) -> list[CorpusPaper]:
         logger.info("Fetching zotero corpus")
         zot = zotero.Zotero(self.config.zotero.user_id, 'user', self.config.zotero.api_key)
@@ -111,10 +134,7 @@ class Executor:
             logger.info("Reranking papers...")
             reranked_papers = self.reranker.rerank(all_papers, corpus)
             reranked_papers = reranked_papers[:self.config.executor.max_paper_num]
-            logger.info("Generating TLDR and affiliations...")
-            for p in tqdm(reranked_papers):
-                p.generate_tldr(self.openai_client, self.config.llm)
-                p.generate_affiliations(self.openai_client, self.config.llm)
+            self.enrich_papers(reranked_papers)
         elif not self.config.executor.send_empty:
             logger.info("No new papers found. No email will be sent.")
             return

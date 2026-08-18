@@ -6,7 +6,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from zotero_arxiv_daily.executor import Executor, normalize_path_patterns
-from zotero_arxiv_daily.protocol import CorpusPaper
+from zotero_arxiv_daily.protocol import CorpusPaper, Paper
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +146,24 @@ def test_fetch_zotero_corpus_paper_with_zero_collections(config, monkeypatch):
 # ---------------------------------------------------------------------------
 # E2E: Executor.run()
 # ---------------------------------------------------------------------------
+
+
+def test_enrich_papers_without_api_key_uses_abstract(config):
+    paper = Paper(
+        source="arxiv",
+        title="No-key paper",
+        authors=["Author"],
+        abstract="Fallback abstract.",
+        url="https://arxiv.org/abs/0000.00000",
+    )
+    executor = Executor.__new__(Executor)
+    executor.config = config
+    executor.openai_client = None
+
+    executor.enrich_papers([paper])
+
+    assert paper.tldr == "Fallback abstract."
+    assert paper.affiliations is None
 
 
 def test_run_end_to_end(config, monkeypatch):
