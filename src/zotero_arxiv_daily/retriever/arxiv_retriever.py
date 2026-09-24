@@ -10,6 +10,7 @@ import multiprocessing
 import os
 from queue import Empty
 from time import sleep
+from types import SimpleNamespace
 from typing import Any, Callable, TypeVar
 from loguru import logger
 import requests
@@ -106,6 +107,39 @@ def _extract_text_from_tar_worker(source_url: str, paper_id: str, paper_title: s
         return file_contents["all"]
 
 
+def _rss_entry_to_result(entry: Any) -> Any:
+    """Build the subset of arxiv.Result used downstream from an arXiv RSS entry."""
+    paper_id = entry.id.removeprefix("oai:arXiv.org:")
+
+    authors = []
+    for author in entry.get("authors", []):
+        name = author.get("name") if hasattr(author, "get") else str(author)
+        if name:
+            authors.append(SimpleNamespace(name=name))
+    if not authors:
+        creator = entry.get("dc_creator") or entry.get("author")
+        if creator:
+            authors = [
+                SimpleNamespace(name=name.strip())
+                for name in str(creator).split(",")
+                if name.strip()
+            ]
+
+    summary = str(entry.get("summary", ""))
+    if "Abstract:" in summary:
+        summary = summary.split("Abstract:", 1)[1].strip()
+
+    entry_id = entry.get("link") or f"https://arxiv.org/abs/{paper_id}"
+    return SimpleNamespace(
+        title=entry.get("title", ""),
+        authors=authors,
+        summary=summary,
+        pdf_url=f"https://arxiv.org/pdf/{paper_id}",
+        entry_id=entry_id,
+        source_url=lambda paper_id=paper_id: f"https://arxiv.org/e-print/{paper_id}",
+    )
+
+
 @register_retriever("arxiv")
 class ArxivRetriever(BaseRetriever):
     def __init__(self, config):
@@ -115,7 +149,6 @@ class ArxivRetriever(BaseRetriever):
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
         client = arxiv.Client(num_retries=10, delay_seconds=10)
-        fallback_client = arxiv.Client(num_retries=1, delay_seconds=3)
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
         # Get the latest paper from arxiv rss feed
@@ -124,11 +157,12 @@ class ArxivRetriever(BaseRetriever):
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
         raw_papers = []
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
-        all_paper_ids = [
-            i.id.removeprefix("oai:arXiv.org:")
-            for i in feed.entries
-            if i.get("arxiv_announce_type", "new") in allowed_announce_types
-        ]
+        rss_entries_by_id = {
+            entry.id.removeprefix("oai:arXiv.org:"): entry
+            for entry in feed.entries
+            if entry.get("arxiv_announce_type", "new") in allowed_announce_types
+        }
+        all_paper_ids = list(rss_entries_by_id)
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
 
@@ -136,8 +170,23 @@ class ArxivRetriever(BaseRetriever):
         bar = tqdm(total=len(all_paper_ids))
         max_batch_retries = 5
         batch_retry_delay = 30
+        use_rss_fallback = False
         for i in range(0, len(all_paper_ids), 20):
             batch_ids = all_paper_ids[i:i + 20]
+            batch_number = i // 20
+            if use_rss_fallback:
+                fallback_batch = [
+                    _rss_entry_to_result(rss_entries_by_id[paper_id])
+                    for paper_id in batch_ids
+                    if paper_id in rss_entries_by_id
+                ]
+                logger.warning(
+                    f"Using arXiv RSS metadata for batch {batch_number} after the API failed."
+                )
+                bar.update(len(fallback_batch))
+                raw_papers.extend(fallback_batch)
+                continue
+
             search = arxiv.Search(id_list=batch_ids)
             for attempt in range(max_batch_retries):
                 try:
@@ -160,27 +209,20 @@ class ArxivRetriever(BaseRetriever):
                     else:
                         logger.warning(
                             f"arXiv API error on batch {i // 20} (status {exc.status}). "
-                            "Falling back to per-paper requests."
+                            "Falling back to RSS metadata."
                         )
 
-                    fallback_batch = []
-                    last_paper_error = None
-                    for paper_id in batch_ids:
-                        try:
-                            fallback_batch.extend(
-                                list(fallback_client.results(arxiv.Search(id_list=[paper_id])))
-                            )
-                        except arxiv.HTTPError as paper_exc:
-                            last_paper_error = paper_exc
-                            logger.warning(
-                                f"Skipping arXiv paper {paper_id} due to API error "
-                                f"status {paper_exc.status}"
-                            )
-                    if not fallback_batch and last_paper_error is not None:
+                    use_rss_fallback = True
+                    fallback_batch = [
+                        _rss_entry_to_result(rss_entries_by_id[paper_id])
+                        for paper_id in batch_ids
+                        if paper_id in rss_entries_by_id
+                    ]
+                    if not fallback_batch:
                         raise RuntimeError(
-                            f"arXiv batch {i // 20} and all per-paper fallback requests "
-                            f"failed; last HTTP status was {last_paper_error.status}"
-                        ) from last_paper_error
+                            f"arXiv API batch {batch_number} failed with HTTP {exc.status}, "
+                            "and no RSS metadata was available for its papers."
+                        ) from exc
 
                     bar.update(len(fallback_batch))
                     raw_papers.extend(fallback_batch)
